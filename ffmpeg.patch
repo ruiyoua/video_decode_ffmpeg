@@ -1,0 +1,162 @@
+diff --git a/libavcodec/avcodec.h b/libavcodec/avcodec.h
+index 3922e89..ba33249 100644
+--- a/libavcodec/avcodec.h
++++ b/libavcodec/avcodec.h
+@@ -1479,6 +1479,10 @@ typedef struct AVPacket {
+      */
+     attribute_deprecated
+     int64_t convergence_duration;
++
++    //  add by chenxq
++    int16_t lost_packet;
++
+ #endif
+ } AVPacket;
+ #define AV_PKT_FLAG_KEY     0x0001 ///< The packet contains a keyframe
+@@ -6182,4 +6186,4 @@ AVCPBProperties *av_cpb_properties_alloc(size_t *size);
+  * @}
+  */
+ 
+-#endif /* AVCODEC_AVCODEC_H */
++#endif /* AVCODEC_AVCODEC_H */
+\ No newline at end of filediff --git a/libavcodec/avpacket.c b/libavcodec/avpacket.c
+index e160ad3..79d0932 100644
+--- a/libavcodec/avpacket.c
++++ b/libavcodec/avpacket.c
+@@ -46,6 +46,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
+     pkt->buf                  = NULL;
+     pkt->side_data            = NULL;
+     pkt->side_data_elems      = 0;
++    //chenxq
++    pkt->lost_packet          = 0;
+ }
+ 
+ AVPacket *av_packet_alloc(void)
+@@ -736,4 +738,4 @@ int ff_side_data_set_encoder_stats(AVPacket *pkt, int quality, int64_t *error, i
+         AV_WL64(side_data+8 + 8*i , error[i]);
+ 
+     return 0;
+-}
++}
+\ No newline at end of filediff --git a/libavformat/rtpdec.c b/libavformat/rtpdec.c
+index e75a34c..d1e6f14 100644
+--- a/libavformat/rtpdec.c
++++ b/libavformat/rtpdec.c
+@@ -815,6 +815,10 @@ static int rtp_parse_one_packet(RTPDemuxContext *s, AVPacket *pkt,
+         return rtcp_parse_packet(s, buf, len);
+     }
+ 
++    //chenxq
++    uint16_t seq = AV_RB16(buf + 2);
++    int lost_packet = seq - s->seq;
++
+     if (s->st) {
+         int64_t received = av_gettime_relative();
+         uint32_t arrival_ts = av_rescale_q(received, AV_TIME_BASE_Q,
+@@ -827,7 +831,7 @@ static int rtp_parse_one_packet(RTPDemuxContext *s, AVPacket *pkt,
+ 
+     if ((s->seq == 0 && !s->queue) || s->queue_size <= 1) {
+         /* First packet, or no reordering */
+-        return rtp_parse_packet_internal(s, pkt, buf, len);
++    	rv = rtp_parse_packet_internal(s, pkt, buf, len);
+     } else {
+         uint16_t seq = AV_RB16(buf + 2);
+         int16_t diff = seq - s->seq;
+@@ -835,26 +839,33 @@ static int rtp_parse_one_packet(RTPDemuxContext *s, AVPacket *pkt,
+             /* Packet older than the previously emitted one, drop */
+             av_log(s->ic, AV_LOG_WARNING,
+                    "RTP: dropping old packet received too late\n");
+-            return -1;
++            rv = -1;
+         } else if (diff <= 1) {
+             /* Correct packet */
+             rv = rtp_parse_packet_internal(s, pkt, buf, len);
+-            return rv;
+         } else {
+             /* Still missing some packet, enqueue this one. */
+             rv = enqueue_packet(s, buf, len);
+-            if (rv < 0)
+-                return rv;
+-            *bufptr = NULL;
+-            /* Return the first enqueued packet if the queue is full,
+-             * even if we're missing something */
+-            if (s->queue_len >= s->queue_size) {
+-                av_log(s->ic, AV_LOG_WARNING, "jitter buffer full\n");
+-                return rtp_parse_queued_packet(s, pkt);
++            if (rv >= 0)
++            {
++				*bufptr = NULL;
++				/* Return the first enqueued packet if the queue is full,
++				 * even if we're missing something */
++				if (s->queue_len >= s->queue_size) {
++					av_log(s->ic, AV_LOG_WARNING, "jitter buffer full\n");
++					rv = rtp_parse_queued_packet(s, pkt);
++				}
++				rv = -1;
+             }
+-            return -1;
+         }
+     }
++
++    if (lost_packet > 1)
++    {
++    	pkt->lost_packet = lost_packet;
++    }
++
++	return rv;
+ }
+ 
+ /**
+@@ -873,9 +884,15 @@ int ff_rtp_parse_packet(RTPDemuxContext *s, AVPacket *pkt,
+     if (s->srtp_enabled && bufptr && ff_srtp_decrypt(&s->srtp, *bufptr, &len) < 0)
+         return -1;
+     rv = rtp_parse_one_packet(s, pkt, bufptr, len);
++    int lost_packet = pkt->lost_packet;
+     s->prev_ret = rv;
+     while (rv < 0 && has_next_packet(s))
+         rv = rtp_parse_queued_packet(s, pkt);
++    if (lost_packet > 0)
++    {
++    	pkt->lost_packet = lost_packet;
++    }
++
+     return rv ? rv : has_next_packet(s);
+ }
+ 
+@@ -937,4 +954,4 @@ int ff_rtp_finalize_packet(AVPacket *pkt, AVIOContext **dyn_buf, int stream_idx)
+         return ret;
+     }
+     return pkt->size;
+-}
++}
+\ No newline at end of filediff --git a/libavformat/utils.c b/libavformat/utils.c
+index 93e588e..0eaf0fa 100644
+--- a/libavformat/utils.c
++++ b/libavformat/utils.c
+@@ -1573,6 +1573,7 @@ static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
+     AVDictionary *metadata = NULL;
+ 
+     av_init_packet(pkt);
++    int lost_packet = 0;
+ 
+     while (!got_packet && !s->internal->parse_queue) {
+         AVStream *st;
+@@ -1580,6 +1581,8 @@ static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
+ 
+         /* read next packet */
+         ret = ff_read_packet(s, &cur_pkt);
++        if (cur_pkt.lost_packet != 0)
++        	lost_packet = cur_pkt.lost_packet;
+         if (ret < 0) {
+             if (ret == AVERROR(EAGAIN))
+                 return ret;
+@@ -1762,6 +1765,9 @@ FF_ENABLE_DEPRECATION_WARNINGS
+                av_ts2str(pkt->dts),
+                pkt->size, pkt->duration, pkt->flags);
+ 
++    if (lost_packet != 0)
++    	pkt->lost_packet = lost_packet;
++
+     return ret;
+ }
+ 
